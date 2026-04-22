@@ -98,6 +98,12 @@ function gmcp_blocks_to_content( array $blocks ): string {
 		$name         = $block['blockName'] ?? 'core/freeform';
 		$attrs        = $block['attrs'] ?? [];
 		$inner        = $block['innerContent'] ?? '';
+		
+		// Handle innerContent as array or string
+		if ( is_array( $inner ) ) {
+			$inner = implode( '', $inner );
+		}
+		
 		$attrs_json   = ! empty( $attrs ) ? ' ' . wp_json_encode( $attrs ) : '';
 		$content     .= "<!-- wp:{$name}{$attrs_json} -->\n{$inner}\n<!-- /wp:{$name} -->\n\n";
 	}
