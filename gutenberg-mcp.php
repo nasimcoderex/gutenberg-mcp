@@ -62,6 +62,13 @@ add_action( 'rest_api_init', function () {
 		'callback'            => 'gmcp_render_blocks',
 		'permission_callback' => 'gmcp_permission',
 	] );
+
+	// POST /analyze-reference
+	register_rest_route( $ns, '/analyze-reference', [
+		'methods'             => 'POST',
+		'callback'            => 'gmcp_analyze_reference',
+		'permission_callback' => 'gmcp_permission',
+	] );
 } );
 
 function gmcp_permission() {
@@ -226,4 +233,230 @@ function gmcp_render_blocks( WP_REST_Request $req ) {
 		$html .= render_block( $parsed );
 	}
 	return rest_ensure_response( [ 'html' => $html ] );
+}
+
+function gmcp_analyze_reference( WP_REST_Request $req ) {
+	$body = $req->get_json_params();
+	$url  = $body['url'] ?? '';
+
+	if ( empty( $url ) ) {
+		return new WP_Error( 'missing_url', 'URL is required', [ 'status' => 400 ] );
+	}
+
+	// Fetch the page content
+	$response = wp_remote_get( $url, [
+		'timeout' => 30,
+		'headers' => [
+			'User-Agent' => 'WordPress/Gutenberg-MCP-Analyzer',
+		],
+	] );
+
+	if ( is_wp_error( $response ) ) {
+		return new WP_Error( 'fetch_failed', $response->get_error_message(), [ 'status' => 500 ] );
+	}
+
+	$html = wp_remote_retrieve_body( $response );
+	
+	// Try to extract the post content from the HTML
+	// Look for common WordPress content containers
+	$content = gmcp_extract_wp_content( $html, $url );
+
+	if ( empty( $content ) ) {
+		return new WP_Error( 'no_content', 'Could not extract content from URL', [ 'status' => 400 ] );
+	}
+
+	// Parse the blocks from the content
+	$blocks = parse_blocks( $content );
+	$blocks = array_values( array_filter( $blocks, fn( $b ) => ! empty( $b['blockName'] ) ) );
+
+	// Extract additional metadata
+	$title = gmcp_extract_title( $html );
+	
+	return rest_ensure_response( [
+		'url'         => $url,
+		'title'       => $title,
+		'blocks'      => $blocks,
+		'block_count' => count( $blocks ),
+		'raw_content' => $content,
+	] );
+}
+
+function gmcp_extract_wp_content( $html, $url ) {
+	// Parse the HTML
+	$dom = new DOMDocument();
+	@$dom->loadHTML( mb_convert_encoding( $html, 'HTML-ENTITIES', 'UTF-8' ), LIBXML_HTML_NOIMPLIED | LIBXML_HTML_NODEFDTD );
+	$xpath = new DOMXPath( $dom );
+
+	// Try multiple selectors to find the main content
+	$selectors = [
+		'//article[contains(@class, "post")]',
+		'//*[contains(@class, "entry-content")]',
+		'//*[contains(@class, "post-content")]',
+		'//*[contains(@class, "content-area")]',
+		'//main[contains(@class, "site-main")]',
+		'//div[contains(@class, "wp-block-post-content")]',
+		'//article',
+		'//main',
+	];
+
+	$content_node = null;
+	foreach ( $selectors as $selector ) {
+		$nodes = $xpath->query( $selector );
+		if ( $nodes && $nodes->length > 0 ) {
+			$content_node = $nodes->item( 0 );
+			break;
+		}
+	}
+
+	if ( ! $content_node ) {
+		return '';
+	}
+
+	// Get the inner HTML
+	$content_html = gmcp_get_inner_html( $content_node );
+
+	// Convert HTML back to Gutenberg block comments
+	$content = gmcp_html_to_blocks( $content_html );
+
+	return $content;
+}
+
+function gmcp_get_inner_html( $node ) {
+	$html = '';
+	foreach ( $node->childNodes as $child ) {
+		$html .= $node->ownerDocument->saveHTML( $child );
+	}
+	return $html;
+}
+
+function gmcp_html_to_blocks( $html ) {
+	// If the HTML already contains Gutenberg block comments, return as-is
+	if ( strpos( $html, '<!-- wp:' ) !== false ) {
+		return $html;
+	}
+
+	// Otherwise, try to intelligently convert HTML to blocks
+	$dom = new DOMDocument();
+	@$dom->loadHTML( mb_convert_encoding( '<div>' . $html . '</div>', 'HTML-ENTITIES', 'UTF-8' ), LIBXML_HTML_NOIMPLIED | LIBXML_HTML_NODEFDTD );
+	
+	$blocks = '';
+	$body = $dom->getElementsByTagName( 'div' )->item( 0 );
+	
+	if ( $body ) {
+		foreach ( $body->childNodes as $node ) {
+			$blocks .= gmcp_node_to_block( $node );
+		}
+	}
+
+	return $blocks;
+}
+
+function gmcp_node_to_block( $node ) {
+	if ( $node->nodeType === XML_TEXT_NODE ) {
+		$text = trim( $node->textContent );
+		if ( empty( $text ) ) {
+			return '';
+		}
+		return "<!-- wp:paragraph -->\n<p>{$text}</p>\n<!-- /wp:paragraph -->\n\n";
+	}
+
+	if ( $node->nodeType !== XML_ELEMENT_NODE ) {
+		return '';
+	}
+
+	$tag = strtolower( $node->nodeName );
+	$html = $node->ownerDocument->saveHTML( $node );
+	$attrs = [];
+
+	// Extract common attributes
+	if ( $node->hasAttribute( 'class' ) ) {
+		$classes = $node->getAttribute( 'class' );
+		$attrs['className'] = $classes;
+		
+		// Extract alignment from classes
+		if ( preg_match( '/has-text-align-(\w+)/', $classes, $matches ) ) {
+			$attrs['align'] = $matches[1];
+		}
+		
+		// Extract text color
+		if ( preg_match( '/has-(\w+)-color/', $classes, $matches ) ) {
+			$attrs['textColor'] = $matches[1];
+		}
+		
+		// Extract background color
+		if ( preg_match( '/has-(\w+)-background-color/', $classes, $matches ) ) {
+			$attrs['backgroundColor'] = $matches[1];
+		}
+	}
+
+	if ( $node->hasAttribute( 'style' ) ) {
+		$attrs['style'] = $node->getAttribute( 'style' );
+	}
+
+	$attrs_json = ! empty( $attrs ) ? ' ' . wp_json_encode( $attrs ) : '';
+
+	// Map HTML tags to Gutenberg blocks
+	switch ( $tag ) {
+		case 'h1':
+			return "<!-- wp:heading {\"level\":1{$attrs_json}} -->\n{$html}\n<!-- /wp:heading -->\n\n";
+		case 'h2':
+			return "<!-- wp:heading {\"level\":2{$attrs_json}} -->\n{$html}\n<!-- /wp:heading -->\n\n";
+		case 'h3':
+			return "<!-- wp:heading {\"level\":3{$attrs_json}} -->\n{$html}\n<!-- /wp:heading -->\n\n";
+		case 'h4':
+			return "<!-- wp:heading {\"level\":4{$attrs_json}} -->\n{$html}\n<!-- /wp:heading -->\n\n";
+		case 'h5':
+			return "<!-- wp:heading {\"level\":5{$attrs_json}} -->\n{$html}\n<!-- /wp:heading -->\n\n";
+		case 'h6':
+			return "<!-- wp:heading {\"level\":6{$attrs_json}} -->\n{$html}\n<!-- /wp:heading -->\n\n";
+		case 'p':
+			return "<!-- wp:paragraph{$attrs_json} -->\n{$html}\n<!-- /wp:paragraph -->\n\n";
+		case 'img':
+			$src = $node->getAttribute( 'src' );
+			$alt = $node->getAttribute( 'alt' );
+			$img_attrs = [ 'url' => $src, 'alt' => $alt ];
+			if ( $node->hasAttribute( 'width' ) ) {
+				$img_attrs['width'] = (int) $node->getAttribute( 'width' );
+			}
+			if ( $node->hasAttribute( 'height' ) ) {
+				$img_attrs['height'] = (int) $node->getAttribute( 'height' );
+			}
+			$img_json = wp_json_encode( array_merge( $attrs, $img_attrs ) );
+			return "<!-- wp:image {$img_json} -->\n{$html}\n<!-- /wp:image -->\n\n";
+		case 'ul':
+			return "<!-- wp:list{$attrs_json} -->\n{$html}\n<!-- /wp:list -->\n\n";
+		case 'ol':
+			return "<!-- wp:list {\"ordered\":true{$attrs_json}} -->\n{$html}\n<!-- /wp:list -->\n\n";
+		case 'blockquote':
+			return "<!-- wp:quote{$attrs_json} -->\n{$html}\n<!-- /wp:quote -->\n\n";
+		case 'pre':
+		case 'code':
+			return "<!-- wp:code{$attrs_json} -->\n{$html}\n<!-- /wp:code -->\n\n";
+		case 'div':
+		case 'section':
+			// Check if it's a columns or group block based on classes
+			$classes = $node->getAttribute( 'class' );
+			if ( strpos( $classes, 'wp-block-columns' ) !== false ) {
+				return "<!-- wp:columns{$attrs_json} -->\n{$html}\n<!-- /wp:columns -->\n\n";
+			} elseif ( strpos( $classes, 'wp-block-column' ) !== false ) {
+				return "<!-- wp:column{$attrs_json} -->\n{$html}\n<!-- /wp:column -->\n\n";
+			} elseif ( strpos( $classes, 'wp-block-group' ) !== false ) {
+				return "<!-- wp:group{$attrs_json} -->\n{$html}\n<!-- /wp:group -->\n\n";
+			}
+			// For generic divs, use group block
+			return "<!-- wp:group{$attrs_json} -->\n<div class=\"wp-block-group\">{$html}</div>\n<!-- /wp:group -->\n\n";
+		default:
+			// For unknown tags, wrap in HTML block
+			return "<!-- wp:html -->\n{$html}\n<!-- /wp:html -->\n\n";
+	}
+}
+
+function gmcp_extract_title( $html ) {
+	if ( preg_match( '/<title[^>]*>(.*?)<\/title>/is', $html, $matches ) ) {
+		$title = html_entity_decode( $matches[1], ENT_QUOTES | ENT_HTML5, 'UTF-8' );
+		// Remove common suffixes
+		$title = preg_replace( '/\s*[-–|]\s*.*$/', '', $title );
+		return trim( $title );
+	}
+	return 'Untitled Page';
 }
